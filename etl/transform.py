@@ -11,21 +11,21 @@ from pyspark.sql.types import DoubleType, LongType
 
 ARGS = getResolvedOptions(sys.argv, [
     'JOB_NAME',
-    'in_database',   # ex: default
-    'in_table',      # ex: b3_pregao_table_raw
-    'out_bucket',    # ex: postech-ml-fase2-us-east-2
-    'out_prefix',    # ex: refined
+    'in_database',  # ex: default
+    'in_table',     # ex: b3_pregao_table_raw
+    'out_bucket',   # ex: postech-ml-fase2-us-east-2
+    'out_prefix',   # ex: refined
     # opcionais:
-    'window_days',   # por linhas (default 7)
-    'mode'           # overwrite|append (default overwrite com overwrite dinamico)
+    'window_days',  # por linhas (default 7)
+    'mode'  # overwrite|append (default overwrite com overwrite dinamico)
 ])
 
 in_database = ARGS.get('in_database', 'default')
-in_table    = ARGS.get('in_table', 'b3_pregao_table_raw')
-out_bucket  = ARGS.get('out_bucket', 'postech-ml-fase2-us-east-2')
-out_prefix  = ARGS.get('out_prefix', 'refined')
-window_n    = int(ARGS.get('window_days', '7'))
-mode        = ARGS.get('mode', 'overwrite').lower()
+in_table = ARGS.get('in_table', 'b3_pregao_table_raw')
+out_bucket = ARGS.get('out_bucket', 'postech-ml-fase2-us-east-2')
+out_prefix = ARGS.get('out_prefix', 'refined')
+window_n = int(ARGS.get('window_days', '7'))
+mode = ARGS.get('mode', 'overwrite').lower()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -90,13 +90,13 @@ df = df.withColumn(
 )
 
 # Janelas de N linhas (ex: 7 últimos registros do código)
-w = Window.partitionBy('code').orderBy('reference_date_date').rowsBetween(-(window_n-1), 0)
+w = Window.partitionBy('code').orderBy('reference_date_date').rowsBetween(-(window_n - 1), 0)
 
-df = df.withColumn('mean_part_7_days',   F.avg('part').over(w)) \
-       .withColumn('median_part_7_days', F.expr('percentile_approx(part, 0.5)').over(w)) \
-       .withColumn('std_part_7_days',    F.stddev('part').over(w)) \
-       .withColumn('max_part_7_days',    F.max('part').over(w)) \
-       .withColumn('min_part_7_days',    F.min('part').over(w))
+df = df.withColumn('mean_part_7_days', F.avg('part').over(w)) \
+    .withColumn('median_part_7_days', F.expr('percentile_approx(part, 0.5)').over(w)) \
+    .withColumn('std_part_7_days', F.stddev('part').over(w)) \
+    .withColumn('max_part_7_days', F.max('part').over(w)) \
+    .withColumn('min_part_7_days', F.min('part').over(w))
 
 # Ordena e prepara para escrita
 out_path = f's3://{out_bucket}/{out_prefix}'
@@ -112,6 +112,6 @@ log.info("Schema final:\n%s", df._jdf.schema().treeString())
  .partitionBy('code', 'reference_date')
  .mode(mode)
  .parquet(out_path)
-)
+ )
 
 job.commit()
