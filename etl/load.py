@@ -16,7 +16,7 @@ ARGS = getResolvedOptions(sys.argv, [
     'bucket_name',   # ex: postech-ml-fase2-us-east-2
     'prefix',        # ex: refined/ (com barra)
     'database',      # ex: default
-    'table',         # ex: b3_prego_table_refined
+    'table',         # ex: b3_pregao_table_refined
     # opcional incremental:
     'input_uri'      # ex: s3://postech-ml-fase2-us-east-2/refined/code=PETR4/reference_date=2024-01-01/part-000.snappy.parquet
 ])
@@ -24,7 +24,7 @@ ARGS = getResolvedOptions(sys.argv, [
 bucket_name = ARGS.get('bucket_name', 'postech-ml-fase2-us-east-2')
 prefix      = ARGS.get('prefix', 'refined/')
 database    = ARGS.get('database', 'default')
-table       = ARGS.get('table', 'b3_prego_table_refined')
+table       = ARGS.get('table', 'b3_pregao_table_refined')
 input_uri   = ARGS.get('input_uri')
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')

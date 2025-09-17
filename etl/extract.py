@@ -13,7 +13,7 @@ ARGS = getResolvedOptions(sys.argv, [
     'bucket',       # ex: postech-ml-fase2-us-east-2
     'prefix',       # ex: raw/  (com ou sem barra)
     'database',     # ex: default
-    'table',        # ex: b3_prego_table_raw
+    'table',        # ex: b3_pregao_table_raw
     # opcional p/ modo incremental:
     'input_uri'     # ex: s3://postech-ml-fase2-us-east-2/raw/date=2025-09-16/b3_.parquet
 ]) if '--JOB_NAME' in sys.argv or 'JOB_NAME' in sys.argv else {
@@ -24,7 +24,7 @@ ARGS = getResolvedOptions(sys.argv, [
 bucket    = ARGS.get('bucket', 'postech-ml-fase2-us-east-2')
 prefix    = ARGS.get('prefix', 'raw/')
 database  = ARGS.get('database', 'default')
-table     = ARGS.get('table', 'b3_prego_table_raw')
+table     = ARGS.get('table', 'b3_pregao_table_raw')
 input_uri = ARGS.get('input_uri')  # None => full scan
 
 

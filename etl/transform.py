@@ -12,7 +12,7 @@ from pyspark.sql.types import DoubleType, LongType
 ARGS = getResolvedOptions(sys.argv, [
     'JOB_NAME',
     'in_database',   # ex: default
-    'in_table',      # ex: b3_prego_table_raw
+    'in_table',      # ex: b3_pregao_table_raw
     'out_bucket',    # ex: postech-ml-fase2-us-east-2
     'out_prefix',    # ex: refined
     # opcionais:
@@ -21,7 +21,7 @@ ARGS = getResolvedOptions(sys.argv, [
 ])
 
 in_database = ARGS.get('in_database', 'default')
-in_table    = ARGS.get('in_table', 'b3_prego_table_raw')
+in_table    = ARGS.get('in_table', 'b3_pregao_table_raw')
 out_bucket  = ARGS.get('out_bucket', 'postech-ml-fase2-us-east-2')
 out_prefix  = ARGS.get('out_prefix', 'refined')
 window_n    = int(ARGS.get('window_days', '7'))
