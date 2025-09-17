@@ -1,127 +1,117 @@
 import sys
+import logging
 from awsglue.transforms import *
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from pyspark.sql import functions as F
-from botocore.exceptions import ClientError
 from pyspark.sql.window import Window
-from pyspark.sql.types import DoubleType
+from pyspark.sql.types import DoubleType, LongType
 
-# Remove columns where all values are null, but always keep essential columns
-# Essential columns: cod, asset, type, part, theoricalQty, date
+ARGS = getResolvedOptions(sys.argv, [
+    'JOB_NAME',
+    'in_database',   # ex: default
+    'in_table',      # ex: b3_prego_table_raw
+    'out_bucket',    # ex: postech-ml-fase2-us-east-2
+    'out_prefix',    # ex: refined
+    # opcionais:
+    'window_days',   # por linhas (default 7)
+    'mode'           # overwrite|append (default overwrite com overwrite dinamico)
+])
 
+in_database = ARGS.get('in_database', 'default')
+in_table    = ARGS.get('in_table', 'b3_prego_table_raw')
+out_bucket  = ARGS.get('out_bucket', 'postech-ml-fase2-us-east-2')
+out_prefix  = ARGS.get('out_prefix', 'refined')
+window_n    = int(ARGS.get('window_days', '7'))
+mode        = ARGS.get('mode', 'overwrite').lower()
 
-def remove_all_null_columns(df, keep_columns=None):
-    if keep_columns is None:
-        keep_columns = []
-    non_null_counts = df.select([F.count(F.col(c)).alias(c)
-                                for c in df.columns]).collect()[0].asDict()
-    # Always keep essential columns, even if all values are null
-    non_all_null_cols = [
-        c for c, count in non_null_counts.items() if count > 0 or c in keep_columns]
-    return df.select(*non_all_null_cols)
-
-
-# @params: [JOB_NAME]
-args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger(__name__)
 
 sc = SparkContext()
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
 job = Job(glueContext)
-job.init(args['JOB_NAME'], args)
+job.init(ARGS['JOB_NAME'], ARGS)
 
-# Read from Glue Catalog table 'b3_tbl' in schema 'default'
+# overwrite dinâmico para não apagar partições não tocadas
+spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+spark.conf.set("spark.sql.session.timeZone", "UTC")
+
 dyf = glueContext.create_dynamic_frame.from_catalog(
-    database="default",
-    table_name="b3_tbl"
+    database=in_database,
+    table_name=in_table
 )
-
 df = dyf.toDF()
 
-# Log: show schema and sample after reading from Glue
-print('Schema after reading from Glue:')
-df.printSchema()
-print('Sample data after reading from Glue:')
-df.show(5)
+# Colunas essenciais esperadas (antes do rename)
+essential = ['cod', 'asset', 'type', 'part', 'theoricalQty', 'date']
 
-# Use the function after renaming columns, passing the original names for protection
-# Since columns are renamed to 'code' and 'ticker', protect both original and new names
-essential_columns = ['cod', 'asset', 'type', 'part', 'theoricalQty', 'date']
-df = remove_all_null_columns(df, keep_columns=essential_columns)
+# Remoção de colunas totalmente nulas (mantém essenciais se existirem)
+non_null_counts = df.select([F.count(F.col(c)).alias(c) for c in df.columns]).collect()[0].asDict()
+keep_cols = [c for c, cnt in non_null_counts.items() if cnt > 0 or c in essential]
+df = df.select(*keep_cols)
 
-# Log: show schema and sample after removing all-null columns
-print('Schema after removing all-null columns:')
-df.printSchema()
-print('Sample data after removing all-null columns:')
-df.show(5)
+# Renomes e normalizações
+if 'cod' in df.columns:
+    df = df.withColumnRenamed('cod', 'code')
+if 'asset' in df.columns:
+    df = df.withColumnRenamed('asset', 'ticker')
+if 'date' in df.columns:
+    df = df.withColumnRenamed('date', 'reference_date')
 
-# Rename columns: 'cod' to 'code', 'asset' to 'ticker'
-df = df.withColumnRenamed('cod', 'code').withColumnRenamed(
-    'asset', 'ticker').withColumnRenamed('date', 'reference_date')
-
-# Ensure 'part' is numeric: replace comma with dot and cast to DoubleType for precision
-# DoubleType is chosen because it provides good precision for financial and fractional values, and is the standard for floating-point numbers in Spark
+# Sanitizações: part (double), theoricalQty (bigint), reference_date (string->date->string)
 if 'part' in df.columns:
-    df = df.withColumn('part', F.regexp_replace(
-        'part', ',', '.').cast(DoubleType()))
+    df = df.withColumn('part', F.regexp_replace(F.col('part'), ',', '.').cast(DoubleType()))
+
+if 'theoricalQty' in df.columns:
+    # remove tudo que não for dígito/sinal e converte pra long
+    df = df.withColumn('theoricalQty', F.regexp_replace('theoricalQty', r'[^0-9-]', '').cast(LongType()))
+
+if 'reference_date' in df.columns:
+    df = df.withColumn('reference_date_date', F.to_date('reference_date', 'yyyy-MM-dd'))
 else:
-    print('Column "part" does not exist in DataFrame!')
+    raise ValueError("Coluna 'reference_date' ausente após renomear 'date'.")
 
-# Log: show schema and sample after renaming columns
-print("Schema after renaming columns 'cod' to 'code' and 'asset' to 'ticker':")
-df.printSchema()
-print('Sample data after renaming columns:')
-df.show(5)
+# Remove linhas sem chave de partição
+df = df.filter(F.col('code').isNotNull() & F.col('reference_date_date').isNotNull())
 
-# Add column initial_date with the earliest date in the DataFrame
-df_dates = df.filter(F.col('reference_date').isNotNull())
-initial_date = df_dates.agg(F.min('reference_date')).collect()[
-    0][0] if df_dates.count() > 0 else None
-if initial_date is not None:
-    df = df.withColumn('initial_date', F.lit(initial_date))
-else:
-    print('No date found to calculate initial_date.')
-    df = df.withColumn('initial_date', F.lit(None))
+# Opcional: deduplicar por (code, reference_date) mantendo o último registro
+df = df.withColumn('rn', F.row_number().over(
+    Window.partitionBy('code', 'reference_date_date').orderBy(F.monotonically_increasing_id())
+)).filter(F.col('rn') == 1).drop('rn')
 
-# Rolling window features: 7-day window, grouped by 'code', ordered by 'reference_date'
-window_7d = Window.partitionBy('code').orderBy('reference_date').rowsBetween(-6, 0)
+# initial_date por código (mínimo dentro do código)
+df = df.withColumn(
+    'initial_date',
+    F.date_format(F.min('reference_date_date').over(Window.partitionBy('code')), 'yyyy-MM-dd')
+)
 
-# Moving average of participation (mean)
-df = df.withColumn('mean_part_7_days', F.avg(F.col('part')).over(window_7d))
-# Moving median of participation (median)
-df = df.withColumn('median_part_7_days', F.expr('percentile_approx(part, 0.5)').over(window_7d))
-# Historical volatility (standard deviation)
-df = df.withColumn('std_part_7_days', F.stddev(F.col('part')).over(window_7d))
-# Recent historical maximum and minimum
-df = df.withColumn('max_part_7_days', F.max(F.col('part')).over(window_7d))
-df = df.withColumn('min_part_7_days', F.min(F.col('part')).over(window_7d))
+# Janelas de N linhas (ex: 7 últimos registros do código)
+w = Window.partitionBy('code').orderBy('reference_date_date').rowsBetween(-(window_n-1), 0)
 
-print("Schema after adding rolling window features:")
-df.printSchema()
-print('Sample data after adding rolling window features:')
-df.show(5)
+df = df.withColumn('mean_part_7_days',   F.avg('part').over(w)) \
+       .withColumn('median_part_7_days', F.expr('percentile_approx(part, 0.5)').over(w)) \
+       .withColumn('std_part_7_days',    F.stddev('part').over(w)) \
+       .withColumn('max_part_7_days',    F.max('part').over(w)) \
+       .withColumn('min_part_7_days',    F.min('part').over(w))
 
-# S3 bucket and output path
-bucket_name = '861115334572-refined'
-output_path = f's3://{bucket_name}/b3'
+# Ordena e prepara para escrita
+out_path = f's3://{out_bucket}/{out_prefix}'
 
-# Filter out rows with null partition columns before writing
-if 'reference_date' in df.columns and 'code' in df.columns:
-    df = df.filter(F.col('reference_date').isNotNull()
-                   & F.col('code').isNotNull())
-    print("Output path:", output_path)
-    print("Sample data before write:")
-    df.show(5)
-    # Check if DataFrame is not empty
-    if not df.rdd.isEmpty():
-        df.write.partitionBy('code', 'reference_date').mode(
-            'overwrite').parquet(output_path)
-    else:
-        print("DataFrame is empty, nothing to write.")
-else:
-    print("Partition columns 'reference_date' or 'code' do not exist in DataFrame.")
+# Mostras rápidas no log (evita prints enormes)
+log.info("Escrevendo em %s", out_path)
+log.info("Schema final:\n%s", df._jdf.schema().treeString())
+
+(df
+ .withColumn('reference_date', F.date_format('reference_date_date', 'yyyy-MM-dd'))
+ .drop('reference_date_date')
+ .write
+ .partitionBy('code', 'reference_date')
+ .mode(mode)
+ .parquet(out_path)
+)
 
 job.commit()

@@ -1,143 +1,207 @@
 import sys
+import re
+import time
+import logging
+from typing import Set, Tuple, List, Dict, Optional
+
 import boto3
 from botocore.exceptions import ClientError
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
-from awsglue.dynamicframe import DynamicFrame
-import re
-import logging
 
-# @params: [JOB_NAME]
-args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+ARGS = getResolvedOptions(sys.argv, [
+    'JOB_NAME',
+    'bucket_name',   # ex: postech-ml-fase2-us-east-2
+    'prefix',        # ex: refined/ (com barra)
+    'database',      # ex: default
+    'table',         # ex: b3_prego_table_refined
+    # opcional incremental:
+    'input_uri'      # ex: s3://postech-ml-fase2-us-east-2/refined/code=PETR4/reference_date=2024-01-01/part-000.snappy.parquet
+])
+
+bucket_name = ARGS.get('bucket_name', 'postech-ml-fase2-us-east-2')
+prefix      = ARGS.get('prefix', 'refined/')
+database    = ARGS.get('database', 'default')
+table       = ARGS.get('table', 'b3_prego_table_refined')
+input_uri   = ARGS.get('input_uri')
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger(__name__)
 
 sc = SparkContext()
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
 job = Job(glueContext)
-job.init(args['JOB_NAME'], args)
+job.init(ARGS['JOB_NAME'], ARGS)
 
-# Parameters
-bucket_name = '861115334572-refined'
-input_path = f's3://{bucket_name}/b3/'
-database_name = 'default'
-table_name = 'b3_tbl_refined'
-
-# Schema definition (adjust as needed)
-schema_columns = [
-    {'Name': 'ticker', 'Type': 'string'},
-    {'Name': 'type', 'Type': 'string'},
-    {'Name': 'part', 'Type': 'double'},
-    {'Name': 'theoricalQty', 'Type': 'string'},
-    {'Name': 'initial_date', 'Type': 'string'},
-    {'Name': 'mean_part_7_days', 'Type': 'double'},
-    {'Name': 'median_part_7_days', 'Type': 'double'},
-    {'Name': 'std_part_7_days', 'Type': 'double'},
-    {'Name': 'max_part_7_days', 'Type': 'double'},
-    {'Name': 'min_part_7_days', 'Type': 'double'}
-]
-input_format = 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat'
-output_format = 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat'
-serde_info = {
+INPUT_FORMAT  = 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat'
+OUTPUT_FORMAT = 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat'
+SERDE_INFO    = {
     'SerializationLibrary': 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe',
-    'Parameters': {}
+    'Parameters': {'serialization.format': '1'}
 }
 
-# Create boto3 client
+# Ajuste o schema conforme seu refined (mantive o seu)
+SCHEMA_COLUMNS = [
+    {'Name': 'ticker',              'Type': 'string'},
+    {'Name': 'type',                'Type': 'string'},
+    {'Name': 'part',                'Type': 'double'},
+    {'Name': 'theoricalQty',        'Type': 'string'},
+    {'Name': 'initial_date',        'Type': 'string'},
+    {'Name': 'mean_part_7_days',    'Type': 'double'},
+    {'Name': 'median_part_7_days',  'Type': 'double'},
+    {'Name': 'std_part_7_days',     'Type': 'double'},
+    {'Name': 'max_part_7_days',     'Type': 'double'},
+    {'Name': 'min_part_7_days',     'Type': 'double'}
+]
+PARTITION_KEYS = [
+    {'Name': 'code',            'Type': 'string'},
+    {'Name': 'reference_date',  'Type': 'string'}
+]
+
 session = boto3.Session()
-glue_client = session.client('glue')
+glue = session.client('glue')
+s3   = session.client('s3')
 
-# Create the table in Glue Data Catalog if it does not exist
+def norm_prefix(p: str) -> str:
+    p = p.lstrip('/')
+    return p if p.endswith('/') else p + '/'
 
+prefix = norm_prefix(prefix)
+base_location = f's3://{bucket_name}/{prefix}'
 
-def ensure_table_exists():
+PART_RE = re.compile(r'code=([^/]+)/reference_date=(\d{4}-\d{2}-\d{2})/')
+
+def ensure_table():
     try:
-        glue_client.get_table(DatabaseName=database_name, Name=table_name)
+        glue.get_table(DatabaseName=database, Name=table)
+        log.info("Tabela %s.%s já existe.", database, table)
     except ClientError as e:
-        if e.response['Error']['Code'] == 'EntityNotFoundException':
-            glue_client.create_table(
-                DatabaseName=database_name,
-                TableInput={
-                    'Name': table_name,
-                    'StorageDescriptor': {
-                        'Columns': schema_columns,
-                        'Location': input_path,
-                        'InputFormat': input_format,
-                        'OutputFormat': output_format,
-                        'SerdeInfo': serde_info
-                    },
-                    'PartitionKeys': [
-                        {'Name': 'code', 'Type': 'string'},
-                        {'Name': 'reference_date', 'Type': 'string'}
-                    ],
-                    'TableType': 'EXTERNAL_TABLE',
-                    'Parameters': {
-                        'classification': 'parquet'
-                    }
-                }
-            )
-        else:
+        if e.response['Error']['Code'] != 'EntityNotFoundException':
             raise
+        glue.create_table(
+            DatabaseName=database,
+            TableInput={
+                'Name': table,
+                'TableType': 'EXTERNAL_TABLE',
+                'Parameters': {'classification': 'parquet', 'EXTERNAL': 'TRUE'},
+                'PartitionKeys': PARTITION_KEYS,
+                'StorageDescriptor': {
+                    'Columns': SCHEMA_COLUMNS,
+                    'Location': base_location,
+                    'InputFormat': INPUT_FORMAT,
+                    'OutputFormat': OUTPUT_FORMAT,
+                    'SerdeInfo': SERDE_INFO,
+                    'StoredAsSubDirectories': True
+                }
+            }
+        )
+        log.info("Tabela %s.%s criada.", database, table)
 
+def existing_parts() -> Set[Tuple[str, str]]:
+    out: Set[Tuple[str, str]] = set()
+    paginator = glue.get_paginator('get_partitions')
+    for page in paginator.paginate(DatabaseName=database, TableName=table):
+        for p in page.get('Partitions', []):
+            vals = p.get('Values', [])
+            if len(vals) >= 2:
+                out.add((vals[0], vals[1]))
+    log.info("Partições já registradas: %d", len(out))
+    return out
 
-ensure_table_exists()
+def parse_from_uri(uri: str) -> Optional[Tuple[str, str]]:
+    m = re.match(r's3://[^/]+/(.+)', uri or '')
+    key = m.group(1) if m else uri
+    m2 = PART_RE.search(key or '')
+    return (m2.group(1), m2.group(2)) if m2 else None
 
-# Read partitioned data from S3
-df = spark.read.parquet(input_path)
+def discover_parts_s3() -> Set[Tuple[str, str]]:
+    found: Set[Tuple[str, str]] = set()
+    paginator = s3.get_paginator('list_objects_v2')
+    for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
+        for obj in page.get('Contents', []):
+            m = PART_RE.search(obj['Key'])
+            if m:
+                found.add((m.group(1), m.group(2)))
+    log.info("Partições encontradas no S3: %d", len(found))
+    return found
 
-dyf = DynamicFrame.fromDF(df, glueContext, 'dyf')
-
-s3_client = boto3.client('s3')
-
-# Extract bucket and prefix from input_path
-bucket = bucket_name
-prefix = 'b3/'
-
-logging.basicConfig(level=logging.INFO)
-
-partitions = set()
-paginator = s3_client.get_paginator('list_objects_v2')
-for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-    for obj in page.get('Contents', []):
-        # Key example: b3/code=ABC/reference_date=2024-01-01/file.parquet
-        match = re.search(r'code=([^/]+)/reference_date=([^/]+)/', obj['Key'])
-        if match:
-            code = match.group(1)
-            reference_date = match.group(2)
-            partitions.add((code, reference_date))
-
-# Build the list of partitions for Glue
-partition_inputs = []
-for code, reference_date in partitions:
-    partition_location = f's3://{bucket}/b3/code={code}/reference_date={reference_date}/'
-    partition_inputs.append({
-        'Values': [code, reference_date],
+def build_partition_input(code: str, refdate: str) -> Dict:
+    return {
+        'Values': [code, refdate],
         'StorageDescriptor': {
-            'Columns': schema_columns,
-            'Location': partition_location,
-            'InputFormat': input_format,
-            'OutputFormat': output_format,
-            'SerdeInfo': serde_info,
+            'Columns': SCHEMA_COLUMNS,
+            'Location': f's3://{bucket_name}/{prefix}code={code}/reference_date={refdate}/',
+            'InputFormat': INPUT_FORMAT,
+            'OutputFormat': OUTPUT_FORMAT,
+            'SerdeInfo': SERDE_INFO,
+            'StoredAsSubDirectories': True,
             'Parameters': {}
         },
         'Parameters': {}
-    })
+    }
 
-# Explicitly register partitions (in batches of up to 100)
-if partition_inputs:
-    for i in range(0, len(partition_inputs), 100):
-        try:
-            response = glue_client.batch_create_partition(
-                DatabaseName=database_name,
-                TableName=table_name,
-                PartitionInputList=partition_inputs[i:i+100]
-            )
-            if response.get('Errors'):
-                logging.error(f"Errors creating partitions: {response['Errors']}")
-            else:
-                logging.info(f"Successfully created partitions batch {i//100 + 1}")
-        except Exception as e:
-            logging.error(f"Exception during batch_create_partition: {e}")
+def batch_create(parts: List[Dict], batch_size=100, max_retries=5):
+    if not parts: return
+    for i in range(0, len(parts), batch_size):
+        batch = parts[i:i+batch_size]
+        attempt = 0
+        while True:
+            try:
+                resp = glue.batch_create_partition(
+                    DatabaseName=database,
+                    TableName=table,
+                    PartitionInputList=batch
+                )
+                errs = resp.get('Errors') or []
+                if errs:
+                    log.warning("Erros no lote %d: %s", (i//batch_size)+1, errs)
+                else:
+                    log.info("Lote %d criado (%d partições).", (i//batch_size)+1, len(batch))
+                break
+            except ClientError as e:
+                code = e.response.get('Error', {}).get('Code', '')
+                if code in {'ThrottlingException','TooManyRequestsException'} and attempt < max_retries:
+                    attempt += 1
+                    time.sleep(min(2**attempt, 32))
+                    continue
+                raise
 
-job.commit()
+def main():
+    ensure_table()
+
+    if input_uri:
+        # Incremental
+        parsed = parse_from_uri(input_uri)
+        if not parsed:
+            log.warning("input_uri sem padrão de partição: %s", input_uri)
+            job.commit()
+            return
+        wanted = {parsed}
+        log.info("Modo incremental: %s", parsed)
+    else:
+        # Full scan
+        wanted = discover_parts_s3()
+
+    if not wanted:
+        log.info("Sem partições a registrar.")
+        job.commit()
+        return
+
+    existing = existing_parts()
+    to_create = sorted(wanted - existing)
+    if not to_create:
+        log.info("Todas as partições já existem.")
+        job.commit()
+        return
+
+    part_inputs = [build_partition_input(code, refdate) for code, refdate in to_create]
+    batch_create(part_inputs)
+
+    job.commit()
+    log.info("Concluído.")
+
+if __name__ == '__main__':
+    main()
